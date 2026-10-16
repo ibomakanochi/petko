@@ -13,11 +13,11 @@
 | Supabase JS SDK (`@supabase/supabase-js`) | Database queries (via service role) |
 | Supabase Auth | JWT verification — `anon` key for user JWTs |
 | `class-validator` + `class-transformer` | DTO validation |
-| `@nestjs/config` | Environment variable management |
+| `@nestjs/config` | Environment variable management. Pinned to CJS `4.0.4` because Vercel's runtime rejects `require(esm)`; do not upgrade to ESM-only versions while the backend compiles to CJS |
 | Joi | Env schema validation at startup |
 | Jest | Unit testing |
 
-> **No TypeORM.** Database access goes through the Supabase JS client using the service role key. There are no raw SQL migrations managed here — schema is managed in the Supabase dashboard or via Supabase CLI.
+> **No TypeORM.** Database access goes through the Supabase JS client using the service role key. Schema lives in `supabase/schema.sql`. Changes to live projects ship as idempotent SQL files (`security-patch-NNN-*.sql` for access-control fixes, `migration-NNN-*.sql` for schema additions), applied in the Supabase SQL editor or with `npx --yes supabase@2.120.0 db query --linked --file supabase/<file>.sql`. Each file has a WHAT / WHY / HOW TO APPLY header and must be safe to re-run.
 
 ---
 
@@ -27,20 +27,33 @@
 petko-be/
 ├── .env                          # Environment variables (never commit)
 ├── .env.example                  # Placeholder committed to repo
+├── supabase/
+│   ├── schema.sql                # Full schema + RLS (run manually in Supabase)
+│   ├── security-patch-*.sql      # Numbered access-control patches for live projects
+│   └── migration-*.sql           # Numbered, idempotent schema migrations (e.g. 002 admin access emails)
 ├── src/
-│   ├── main.ts                   # Bootstrap — pipes, filters, interceptors, CORS
+│   ├── bootstrap.ts              # configureApp() + createApp() — prefix, pipes, filters, interceptors, CORS
+│   ├── main.ts                   # Local server: createApp() + listen(PORT)
+│   ├── serverless.ts             # Vercel handler: cached createApp() + init()
 │   ├── app.module.ts             # Root module — imports all feature + core modules
+│   ├── app.controller.ts         # GET /api/health (no DB access)
 │   ├── config/
 │   │   └── env.validation.ts     # Joi schema — validates all env vars at startup
 │   ├── common/
+│   │   ├── constants/
+│   │   │   └── admin-access.constants.ts  # ADMIN_ACCESS_EMAILS_TABLE
+│   │   ├── utils/
+│   │   │   └── email.util.ts     # normalizeEmail(), escapeLikePattern()
+│   │   ├── testing/
+│   │   │   └── supabase-query.mock.ts  # Chainable Supabase query mock for specs
 │   │   ├── decorators/
 │   │   │   ├── roles.decorator.ts
 │   │   │   └── current-user.decorator.ts
 │   │   ├── filters/
 │   │   │   └── http-exception.filter.ts
 │   │   ├── guards/
-│   │   │   ├── auth.guard.ts     # Verifies Supabase JWT
-│   │   │   └── roles.guard.ts    # Checks user role from DB
+│   │   │   ├── auth.guard.ts     # Verifies Supabase JWT, attaches profile with the effective role
+│   │   │   └── roles.guard.ts    # Checks request.user.role against @Roles()
 │   │   ├── interceptors/
 │   │   │   └── response.interceptor.ts
 │   │   └── types/
@@ -50,6 +63,16 @@ petko-be/
 │   │   └── supabase.module.ts    # Provides SupabaseService globally
 │   │   └── supabase.service.ts   # Supabase admin client (service role)
 │   └── modules/
+│       ├── admin-access-emails/  # Admin-only CRUD for public.admin_access_emails (service exported)
+│       │   ├── admin-access-emails.module.ts
+│       │   ├── admin-access-emails.controller.ts
+│       │   ├── admin-access-emails.service.ts
+│       │   └── dto/
+│       │       └── create-admin-access-email.dto.ts
+│       ├── admin-stats/          # GET /api/admin/stats (imports Users, Products, AdminAccessEmails)
+│       │   ├── admin-stats.module.ts
+│       │   ├── admin-stats.controller.ts
+│       │   └── admin-stats.service.ts
 │       ├── users/
 │       │   ├── users.module.ts
 │       │   ├── users.controller.ts
@@ -80,6 +103,7 @@ petko-be/
 │           ├── checkout.controller.ts
 │           └── checkout.service.ts   # Scaffolded — gateway TBA
 └── test/
+    ├── setup-env.ts              # Jest setupFiles — dummy env, VERCEL=1 (no .env read)
     └── app.e2e-spec.ts
 ```
 
@@ -101,20 +125,17 @@ SUPABASE_URL=your_supabase_project_url_here
 SUPABASE_SERVICE_ROLE_KEY=your_service_role_key_here
 SUPABASE_ANON_KEY=your_anon_key_here
 
-# CORS
-FRONTEND_URL=http://localhost:5173
+# OPTIONAL — CORS for a cross-origin frontend only.
+# Not needed with the Vite dev proxy or on Vercel (same origin).
+# FRONTEND_URL=http://localhost:5173
 ```
 
-Create `petko-be/.env.example` (commit this):
+`petko-be/.env.example` (committed) has the same keys with placeholder values.
 
-```env
-NODE_ENV=development
-PORT=3000
-SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=
-SUPABASE_ANON_KEY=
-FRONTEND_URL=http://localhost:5173
-```
+Rules:
+- Validation lives in `src/config/env.validation.ts` (Joi). Required: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_ANON_KEY`. Optional: `FRONTEND_URL`. Defaulted: `NODE_ENV`, `PORT`.
+- `ConfigModule.forRoot({ ignoreEnvFile: Boolean(process.env.VERCEL) })`: on Vercel only project env vars are used. A `.env` file is never read in production.
+- On Vercel, set only the three `SUPABASE_*` vars. Do not set `NODE_ENV`, `PORT` or `FRONTEND_URL`.
 
 ---
 
@@ -126,7 +147,7 @@ FRONTEND_URL=http://localhost:5173
 | **Service role key** | All DB read/write from the backend | **CRITICAL** — bypasses RLS |
 
 **Rules:**
-- The **service role key** lives only in `petko-be/.env` — never sent to the frontend, never logged
+- The **service role key** lives only in `petko-be/.env` locally and as a Sensitive Vercel env var in production — never sent to the frontend, never logged
 - The **anon key** is used only for JWT verification with `supabase.auth.getUser(token)`
 - All Supabase DB operations go through the **service role client** (`SupabaseService`) inside NestJS services only
 
@@ -189,55 +210,14 @@ Import `SupabaseModule` once in `app.module.ts`. Because it is `@Global()`, all 
 
 ## Authentication Guard
 
-The `AuthGuard` validates the Bearer JWT sent from the frontend (issued by Supabase after Google SSO). It attaches the verified user to `request.user`.
+The `AuthGuard` (`src/common/guards/auth.guard.ts`) validates the Bearer JWT sent from the frontend (issued by Supabase after Google SSO) and attaches the profile to `request.user` with the **effective role**:
 
-### `src/common/guards/auth.guard.ts`
+1. Missing/malformed `Authorization` header or an invalid token (`anon.auth.getUser(token)`) → `401`.
+2. In parallel: load the `public.users` profile (`id, email, full_name, avatar_url, role`; missing → `401`), and look up the verified auth email (`normalizeEmail(user.email)`) in `ADMIN_ACCESS_EMAILS_TABLE`. The lookup only runs when `user.email_confirmed_at` is set.
+3. If the email is listed, `request.user = { ...profile, role: 'admin' }`. The effective role is never written back to `users.role`.
+4. **Fail closed**: if the list lookup errors, log a warning and keep the stored role. Never grant, never 500.
 
-```ts
-import {
-  CanActivate,
-  ExecutionContext,
-  Injectable,
-  UnauthorizedException,
-} from '@nestjs/common'
-import { SupabaseService } from '@/supabase/supabase.service'
-import { AuthenticatedRequest } from '@/common/types/authenticated-request.type'
-
-@Injectable()
-export class AuthGuard implements CanActivate {
-  constructor(private readonly supabase: SupabaseService) {}
-
-  async canActivate(context: ExecutionContext): Promise<boolean> {
-    const request = context.switchToHttp().getRequest<AuthenticatedRequest>()
-    const authHeader = request.headers['authorization']
-
-    if (!authHeader?.startsWith('Bearer ')) {
-      throw new UnauthorizedException('Missing or invalid Authorization header')
-    }
-
-    const token = authHeader.split(' ')[1]
-    const { data: { user }, error } = await this.supabase.anon.auth.getUser(token)
-
-    if (error || !user) {
-      throw new UnauthorizedException('Invalid or expired token')
-    }
-
-    // Fetch role from our public users table
-    const { data: profile, error: profileError } = await this.supabase.admin
-      .from('users')
-      .select('id, email, full_name, avatar_url, role')
-      .eq('id', user.id)
-      .single()
-
-    if (profileError || !profile) {
-      throw new UnauthorizedException('User profile not found')
-    }
-
-    request.user = profile
-    return true
-  }
-}
-```
+`RolesGuard` only reads `request.user.role`, so every `@Roles('admin')` route honors the list. `UsersService` uses the same rule (`findAll` returns the effective role plus `admin_access_listed`; last-admin checks count effective admins). Unit tests mock `SupabaseService` (see `auth.guard.spec.ts`).
 
 ### `src/common/types/authenticated-request.type.ts`
 
@@ -449,43 +429,39 @@ export class HttpExceptionFilter implements ExceptionFilter {
 
 ---
 
-## `main.ts` Bootstrap
+## Bootstrap (`bootstrap.ts`, `main.ts`, `serverless.ts`)
+
+The app runs in two hosts, and both share one setup function:
+
+- **`src/bootstrap.ts`**
+  - `configureApp(app)`: global prefix `api` (`API_PREFIX`), `x-powered-by` disabled, CORS only when `FRONTEND_URL` is set (`credentials: false`, since auth is a Bearer header), `ValidationPipe({ whitelist, forbidNonWhitelisted, transform })`, `HttpExceptionFilter`, `ResponseInterceptor`.
+  - `createApp()`: `NestFactory.create(AppModule, new ExpressAdapter(), { abortOnError: false })` + `configureApp`. `abortOnError: false` makes init errors reject instead of exiting the process.
+- **`src/main.ts`** (local / `npm run start:dev`): `createApp()` + `listen(PORT)`, serving `http://localhost:3000/api`.
+- **`src/serverless.ts`** (Vercel): default-exported `(req, res)` handler. It requires `./bootstrap` **lazily** on the first request (importing `AppModule` starts env validation, which would otherwise crash the function at load time), caches the `createApp()` + `init()` promise in module scope (once per warm instance), clears the cache if bootstrap fails, and forwards to the Express instance. On a bootstrap failure it logs the stack and answers with the standard JSON envelope `{ success: false, statusCode: 500, message: 'Internal server error', errors: [] }` (no details leaked). The repo-root `api/index.js` re-exports `petko-be/dist/serverless.js`, so it must be built by `nest build` first.
 
 ```ts
-import { NestFactory } from '@nestjs/core'
-import { ValidationPipe } from '@nestjs/common'
+// src/main.ts
 import { ConfigService } from '@nestjs/config'
-import { AppModule } from './app.module'
-import { ResponseInterceptor } from './common/interceptors/response.interceptor'
-import { HttpExceptionFilter } from './common/filters/http-exception.filter'
+import { API_PREFIX, createApp } from './bootstrap'
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule)
+async function bootstrap(): Promise<void> {
+  const app = await createApp()
   const config = app.get(ConfigService)
-
-  app.enableCors({
-    origin: config.getOrThrow<string>('FRONTEND_URL'),
-    credentials: true,
-  })
-
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true,
-      forbidNonWhitelisted: true,
-      transform: true,
-    })
-  )
-
-  app.useGlobalFilters(new HttpExceptionFilter())
-  app.useGlobalInterceptors(new ResponseInterceptor())
 
   const port = config.get<number>('PORT') ?? 3000
   await app.listen(port)
-  console.log(`Petko API running on http://localhost:${port}`)
+  console.log(`🐾 Petko API running on http://localhost:${port}/${API_PREFIX}`)
 }
 
-bootstrap()
+void bootstrap()
 ```
+
+Rules:
+- Add new global middleware, pipes, filters, interceptors and CORS changes in `configureApp` only, so local and serverless never diverge.
+- Every route is under `/api`. Controllers declare paths without the prefix (`@Controller('products')` → `/api/products`).
+- `GET /api/health` returns `{ status: 'ok' }` with no DB access. Use it for smoke checks.
+- Static admin routes on a controller with `:id` params must be declared before `@Get(':id')` (e.g. `GET /products/admin/all`). UUID route params use `ParseUUIDPipe`.
+- Never interpolate raw user input into PostgREST filter strings (`.or(...)`). Whitelist enum values and strip reserved characters (see `ProductsService`).
 
 ---
 
@@ -561,17 +537,26 @@ export class CreateProductDto {
 - Throw NestJS built-in exceptions only — never raw `Error`
 - Common exceptions: `NotFoundException`, `BadRequestException`, `ForbiddenException`, `UnauthorizedException`, `ConflictException`
 - The global `HttpExceptionFilter` formats all errors into the standard envelope
+- **Never return a Supabase/Postgres `error.message` to the client.** Log `error.code` + `error.message` with the service's Nest `Logger`, then throw a user-safe message that says what failed. Validation (class-validator) messages are returned as-is.
+- supabase-js **returns** `{ error }` and does not throw (including `auth.admin.*`). Always check `error`; a try/catch alone never fires.
+- Map known Postgres codes where useful (e.g. `23505` unique violation → `ConflictException`, `PGRST116` no row → `NotFoundException`).
+- Match emails literally: `normalizeEmail()` before storing or comparing, and `escapeLikePattern()` before any `ilike`.
 
 ```ts
 // Example in a service
+private readonly logger = new Logger(ProductsService.name)
+
 const { data, error } = await this.supabase.admin
   .from('products')
-  .select('*')
-  .eq('id', id)
+  .insert(dto)
+  .select()
   .single()
 
 if (error || !data) {
-  throw new NotFoundException(`Product with id ${id} not found`)
+  this.logger.error(`Product create failed: ${error?.code} ${error?.message}`)
+  throw new BadRequestException(
+    'Could not create the product. Check the fields and try again.',
+  )
 }
 ```
 
@@ -611,6 +596,15 @@ if (error || !data) {
 - Mock `SupabaseService` in all unit tests — no real network calls
 - Use `@nestjs/testing` + `Test.createTestingModule()`
 - E2E tests go in `test/` at project root (only exception to co-location)
+- Both Jest configs load `test/setup-env.ts` (dummy Supabase vars, `VERCEL=1`), so tests never read the real `.env`.
+- `src/bootstrap.spec.ts` boots the real app via `createApp()` and checks the `/api` prefix, 401s on guarded routes, and the error envelope. Extend it when adding global setup.
+- Lint: `npx eslint "{src,test}/**/*.ts"` must exit 0. Prettier is configured with `"semi": false`.
+- Use `common/testing/supabase-query.mock.ts` for chainable Supabase query mocks instead of hand-rolling one per spec.
+- Typecheck: `npx tsc --noEmit -p tsconfig.json` must exit 0 under the repo TypeScript (5.9) and TS 6 (`node ../petko-fe/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json`).
+
+## TypeScript Config
+
+`tsconfig.json` has **no `baseUrl`** (deprecated in TS 6 as TS5101, removed in TS 7). `paths` entries are relative to the tsconfig (`"@/*": ["./src/*"]`), and `types` is explicit (`["node", "jest"]`) because TS 6 defaults it to `[]`. `nest build` rewrites `@/` imports to relative requires in `dist/`, and Jest maps `@/` with `moduleNameMapper`. Don't reintroduce `baseUrl` or `ignoreDeprecations`.
 
 ---
 
